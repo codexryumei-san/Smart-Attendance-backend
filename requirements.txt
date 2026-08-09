@@ -10,3 +10,4 @@ Flask
 Flask-SQLAlchemy
 psycopg2-binary
 python-dotenv
+face_recognition
