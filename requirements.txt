@@ -6,3 +6,5 @@ dlib-bin>=19.24.0
 face_recognition_models>=0.3.0
 click
 Pillow
+psycopg2-binary
+python-dotenv

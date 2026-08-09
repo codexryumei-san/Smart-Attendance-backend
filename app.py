@@ -5,6 +5,32 @@ import numpy as np
 import csv
 from io import StringIO
 import dlib
+import os
+from flask import Flask
+from flask_sqlalchemy import SQLAlchemy
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+app = Flask(__name__)
+
+# Fetch the Supabase URL from Render
+database_url = os.getenv("DATABASE_URL")
+
+# SQLAlchemy requires 'postgresql://', but some cloud hosts provide 'postgres://'. This fixes it automatically.
+if database_url and database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+# Set the production database
+app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+
+# Ensure tables are created in Supabase when the app starts
+with app.app_context():
+    db.create_all()
 
 try:
     import face_recognition
@@ -139,14 +165,45 @@ def get_courses():
     ])
 
 
-@app.route("/api/sessions/start", methods=["POST"])
-def start_session():
-    """Start a new attendance session for a specific group course."""
-    data = request.get_json(silent=True) or {}
-    group_course_id = data.get("group_course_id")
+#@app.route("/api/sessions/start", methods=["POST"])
+
+#def start_session():
+ #   """Start a new attendance session for a specific group course."""
+ #   data = request.get_json(silent=True) or {}
+ #   group_course_id = data.get("group_course_id")
     
-    if not group_course_id:
-        return jsonify({"error": "group_course_id is required"}), 400
+  #  if not group_course_id:
+  #      return jsonify({"error": "group_course_id is required"}), 400
+    
+@app.route('/api/sessions/start', methods=['POST'])
+def start_session():
+    data = request.json
+    course_id = data.get('course_id')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Check if a session already exists for this course
+    existing_session = cursor.execute(
+        "SELECT id, status FROM sessions WHERE course_id = ?", (course_id,)
+    ).fetchone()
+    
+    if existing_session:
+        # If it's already closed or active, re-activate/resume it instead of throwing a 409 error
+        cursor.execute(
+            "UPDATE sessions SET status = 'ACTIVE' WHERE course_id = ?", (course_id,)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "success", "message": "Session reactivated/resumed"}), 200
+
+    # Otherwise, create a brand new session
+    cursor.execute(
+        "INSERT INTO sessions (course_id, status) VALUES (?, 'ACTIVE')", (course_id,)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "message": "New session started"}), 201
     
     try:
         with get_connection() as conn:
