@@ -1,7 +1,10 @@
-FROM python:3.10-slim
+FROM python:3.10-slim-bullseye
 
-# Install C++ dependencies required for dlib and OpenCV
-RUN apt-get update && apt-get install -y \
+# Prevent Linux from pausing to ask Y/N questions during installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Use a more robust install command
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     libopenblas-dev \
@@ -14,7 +17,6 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy requirements and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install gunicorn
@@ -23,5 +25,5 @@ COPY . .
 
 EXPOSE 5000
 
-# Start production WSGI server
+# Start production server
 CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:5000", "app:app"]
