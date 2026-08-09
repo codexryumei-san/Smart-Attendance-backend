@@ -1,9 +1,20 @@
 from db import get_connection, init_db
+from dotenv import load_dotenv
+load_dotenv()  # Add these two lines near the very top!
+
+# ... your existing imports (from app import app, db, etc.)
 
 def seed_courses():
     """Seed sample courses for testing the kiosk interface."""
     init_db()
-    
+
+    # Look for where you create your test user and add the flag:
+    test_rep = Student(
+    student_id="REP001",
+    name="Ryūmei",
+    # ... your existing face encoding fields ...
+    is_course_rep=True  # <-- Make sure to add this!
+)
     courses = [
         ("Group A", "Introduction to Computer Science", "CS101"),
         ("Group A", "Data Structures and Algorithms", "CS201"),
