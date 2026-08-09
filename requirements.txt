@@ -7,4 +7,6 @@ Pillow
 Flask
 Flask-SQLAlchemy
 psycopg2-binary
-python-dotenv 
+python-dotenv
+face_recognition
+face_recognition_models 

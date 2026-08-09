@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Download pre-compiled dlib instantly!
-RUN conda install -y -c conda-forge dlib face_recognition
+RUN conda install -y -c conda-forge dlib 
 
 COPY requirements.txt .
 
