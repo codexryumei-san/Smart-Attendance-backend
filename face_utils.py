@@ -6,8 +6,8 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-import face_recognition
-import numpy as np
+import os
+import requests
 
 
 def decode_base64_image(image_base64: str) -> np.ndarray:
