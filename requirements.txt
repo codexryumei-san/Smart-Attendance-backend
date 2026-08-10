@@ -8,5 +8,4 @@ Flask
 Flask-SQLAlchemy
 psycopg2-binary
 python-dotenv
-git+https://github.com/ageitgey/face_recognition_models
 face_recognition
