@@ -3,6 +3,7 @@ import time
 import base64
 import requests
 import csv
+from werkzeug.security import generate_password_hash, check_password_hash
 from io import StringIO
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, Response
@@ -233,5 +234,77 @@ def get_active_session():
         session = conn.execute("SELECT * FROM sessions WHERE status = 'active' ORDER BY opened_at DESC LIMIT 1").fetchone()
     return jsonify({"session": dict(session) if session else None}), 200
 
+# ==========================================
+# USER AUTHENTICATION ROUTES (Admin & Lecturer)
+# ==========================================
+
+@app.route("/api/register", methods=["POST"])
+def register_user():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    role = (data.get("role") or "lecturer").strip()
+
+    if not all([name, email, password, role]):
+        return jsonify({"error": "All fields are required."}), 400
+
+    try:
+        with get_connection() as conn:
+            # Check if email already exists
+            existing = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+            if existing:
+                return jsonify({"error": "This email is already registered."}), 409
+
+            # Hash the password securely using werkzeug
+            hashed_password = generate_password_hash(password)
+
+            # Insert into the users table we created in Supabase
+            conn.execute(
+                """
+                INSERT INTO users (name, email, password_hash, role)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, email, hashed_password, role)
+            )
+            conn.commit()
+
+        return jsonify({
+            "success": True,
+            "role": role,
+            "message": "Account created successfully!"
+        }), 201
+
+    except Exception as exc:
+        print(exc)
+        return jsonify({"error": "Failed to create account. Please try again."}), 500
+
+
+@app.route("/api/login", methods=["POST"])
+def login_user():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+
+    if not email or not password:
+        return jsonify({"error": "Email and password are required."}), 400
+
+    try:
+        with get_connection() as conn:
+            user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+
+        # Verify user exists and password hash matches using werkzeug
+        if user and check_password_hash(user["password_hash"], password):
+            return jsonify({
+                "success": True,
+                "role": user["role"],
+                "name": user["name"]
+            }), 200
+        else:
+            return jsonify({"error": "Invalid email or password."}), 401
+
+    except Exception as exc:
+        print(exc)
+        return jsonify({"error": "Login failed due to a server error."}), 500
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
