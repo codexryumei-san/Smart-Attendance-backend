@@ -6,7 +6,8 @@ DATABASE_PATH = Path(__file__).parent / "database.db"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE,
+    fullname TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('admin', 'lecturer', 'course_rep')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))

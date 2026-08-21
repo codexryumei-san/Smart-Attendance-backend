@@ -238,13 +238,13 @@ def get_active_session():
 # USER AUTHENTICATION ROUTES (Admin & Lecturer)
 # ==========================================
 
-@app.route("/api/register", methods=["POST"])
+@app.route("/api/auth/register", methods=["POST"])
 def register_user():
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     email = (data.get("email") or "").strip()
     password = data.get("password") or ""
-    role = (data.get("role") or "lecturer").strip()
+    role = data.get("role").strip()
 
     if not all([name, email, password, role]):
         return jsonify({"error": "All fields are required."}), 400
@@ -280,7 +280,7 @@ def register_user():
         return jsonify({"error": "Failed to create account. Please try again."}), 500
 
 
-@app.route("/api/login", methods=["POST"])
+@app.route("/api/auth/login", methods=["POST"])
 def login_user():
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip()
