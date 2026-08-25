@@ -1,41 +1,21 @@
 import os
 import time
-import base64
 import requests
-import csv
 from werkzeug.security import generate_password_hash, check_password_hash
-from io import StringIO
-from datetime import datetime, timedelta
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 from db import get_connection, init_db
 
-# Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173", "http://localhost:5174"])
 
-# Fetch the Supabase URL from Render
-database_url = os.getenv("DATABASE_URL")
-if database_url and database_url.startswith("postgres://"):
-    database_url = database_url.replace("postgres://", "postgresql://", 1)
-
-app.config['SQLALCHEMY_DATABASE_URI'] = database_url
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-db = SQLAlchemy(app)
-
-with app.app_context():
-    db.create_all()
-
+# Initialize live Supabase database
 init_db()
 
-# --- Helper Function for Base64 ---
 def clean_base64(b64_str):
-    """Removes the data URI prefix from base64 strings so Face++ can read them."""
     if not b64_str: 
         return ""
     if "," in b64_str:
@@ -44,8 +24,9 @@ def clean_base64(b64_str):
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "message": "Smart Attendance API is running via Face++"})
+    return jsonify({"status": "ok", "message": "Smart Attendance API is running on Supabase & Face++"})
 
+# --- 1. STUDENT REGISTRATION (Dynamic Level Upgrade) ---
 @app.route("/api/register", methods=["POST"])
 def register_student():
     data = request.get_json(silent=True) or {}
@@ -54,12 +35,13 @@ def register_student():
     index_number = (data.get("index_number") or "").strip()
     programme = (data.get("programme") or "").strip()
     level = (data.get("level") or "").strip()
+    admission_year = data.get("admission_year") 
     biometric_consent = bool(data.get("biometric_consent", False))
     image_base64 = data.get("image") or data.get("image_base64") or ""
     group_raw = data.get("group")
     group = str(group_raw).strip() if group_raw else None
 
-    missing = [field for field, value in [("name", name), ("index_number", index_number), ("programme", programme), ("level", level)] if not value]
+    missing = [field for field, value in [("name", name), ("index_number", index_number), ("programme", programme), ("admission_year", admission_year)] if not value]
     if missing:
         return jsonify({"message": f"Missing required fields: {', '.join(missing)}"}), 400
     if not biometric_consent:
@@ -67,36 +49,36 @@ def register_student():
     if not image_base64:
         return jsonify({"error": "A webcam photo is required to complete registration."}), 400
 
-    # Clean the image and encode to bytes for database storage
     clean_image = clean_base64(image_base64)
     
     try:
         with get_connection() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO students (name, index_number, programme, group_name, level, biometric_consent)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO students (name, index_number, programme, level, group_name, admission_year, biometric_consent)
+                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
                 """,
-                (name, index_number, programme, group, level, int(biometric_consent)),
+                (name, index_number, programme, level, group, int(admission_year), int(biometric_consent)),
             )
-            student_id = cursor.lastrowid
+            student_id = cursor.fetchone()["id"]
             
-            # Save the raw base64 string instead of a mathematical encoding
             conn.execute(
                 """
                 INSERT INTO face_encodings (student_id, encoding)
-                VALUES (?, ?)
+                VALUES (%s, %s)
                 """,
                 (student_id, clean_image.encode('utf-8')),
             )
             conn.commit()
     except Exception as exc:
-        if "UNIQUE constraint failed" in str(exc):
+        print("🚨 REGISTRATION ERROR:", exc)
+        if "unique constraint" in str(exc).lower():
             return jsonify({"message": "A student with this index number already exists."}), 409
         return jsonify({"message": "Failed to register student."}), 500
-
     return jsonify({"message": "Student registered successfully.", "student": {"name": name}}), 201
 
+
+# --- 2. LIVE FACE VERIFICATION ENGINE ---
 @app.route("/api/recognize", methods=["POST"])
 def recognize_face():
     data = request.get_json(silent=True) or {}
@@ -109,7 +91,7 @@ def recognize_face():
     api_secret = os.getenv('FACEPLUSPLUS_API_SECRET')
     
     if not api_key or not api_secret:
-        return jsonify({"status": "error", "message": "API keys are missing from Render environment."}), 500
+        return jsonify({"status": "error", "message": "API keys are missing."}), 500
 
     webcam_b64 = clean_base64(image_base64)
 
@@ -133,25 +115,26 @@ def recognize_face():
                 """
                 SELECT s.id, s.name, s.index_number, fe.encoding
                 FROM students s JOIN face_encodings fe ON s.id = fe.student_id
-                WHERE s.group_name = ?
+                WHERE s.group_name = %s
                 """, (group_name,)
             ).fetchall()
 
             if not students_data:
                 return jsonify({"status": "no_students_in_group"}), 200
 
-            # Loop through students and ask Face++ if the photo matches
             matched_student = None
             best_confidence = 0
-            
             url = "https://api-us.faceplusplus.com/facepp/v3/compare"
 
             for student in students_data:
-                # Decode the saved base64 string from the database
                 try:
-                    db_image_b64 = student["encoding"].decode('utf-8')
+                    encoding_val = student["encoding"]
+                    if isinstance(encoding_val, str):
+                        db_image_b64 = encoding_val
+                    else:
+                        db_image_b64 = encoding_val.tobytes().decode('utf-8')
                 except Exception:
-                    continue # Skip old students registered before Face++ update
+                    continue 
 
                 payload = {
                     'api_key': api_key,
@@ -166,28 +149,25 @@ def recognize_face():
                 conf = face_data.get('confidence', 0)
                 if conf > best_confidence:
                     best_confidence = conf
-                    if conf > 80: # 80% is a confirmed match!
+                    if conf > 80:
                         matched_student = student
                         break 
                 
-                # Sleep briefly to avoid Free Tier Face++ rate limits
                 time.sleep(1.2)
 
             if not matched_student:
                 return jsonify({"status": "no_match"}), 200
 
-            # Check for duplicates
             existing = conn.execute(
-                "SELECT id FROM attendance WHERE session_id = ? AND student_id = ?",
+                "SELECT id FROM attendance WHERE session_id = %s AND student_id = %s",
                 (session_id, matched_student["id"])
             ).fetchone()
             
             if existing:
                 return jsonify({"status": "duplicate", "student_name": matched_student["name"]}), 200
             
-            # Record attendance
             conn.execute(
-                "INSERT INTO attendance (session_id, student_id, verification_mode) VALUES (?, ?, 'biometric')",
+                "INSERT INTO attendance (session_id, student_id, verification_mode) VALUES (%s, %s, 'biometric')",
                 (session_id, matched_student["id"])
             )
             conn.commit()
@@ -202,31 +182,78 @@ def recognize_face():
         print(exc)
         return jsonify({"status": "error", "message": "Detection failed."}), 500
 
-# Keep the remaining routes exactly the same as your original file
-@app.route("/api/courses", methods=["GET"])
-def get_courses():
-    with get_connection() as conn:
-        courses = conn.execute("SELECT id, group_name, course_name, course_code FROM group_courses").fetchall()
-    return jsonify([{"id": c["id"], "group_name": c["group_name"], "course_name": c["course_name"]} for c in courses])
 
+# --- 3. COURSE MANAGEMENT ---
+# --- 3. COURSE MANAGEMENT ---
+@app.route("/api/courses", methods=["POST"])
+def add_course():
+    data = request.get_json()
+    
+    course_name = data.get("course_name")
+    course_code = data.get("course_code") 
+    level = data.get("level")
+    lecturer_id = data.get("lecturer_id")
+    programmes = data.get("programmes", [])
+    it_groups = data.get("it_groups", [])
+
+    if not course_name or not programmes or not lecturer_id:
+        return jsonify({"error": "Course details, lecturer, and at least one programme are required."}), 400
+
+    try:
+        with get_connection() as conn:
+            for prog in programmes:
+                if prog == "BSc. Information Technology" and it_groups:
+                    for grp in it_groups:
+                        conn.execute("""
+                            INSERT INTO group_courses (course_name, course_code, programme, group_name, level, lecturer_id)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (group_name, course_code) 
+                            DO UPDATE SET course_name = EXCLUDED.course_name, level = EXCLUDED.level, lecturer_id = EXCLUDED.lecturer_id
+                        """, (course_name, course_code, prog, grp, level, lecturer_id))
+                else:
+                    conn.execute("""
+                        INSERT INTO group_courses (course_name, course_code, programme, group_name, level, lecturer_id)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (group_name, course_code) 
+                        DO UPDATE SET course_name = EXCLUDED.course_name, level = EXCLUDED.level, lecturer_id = EXCLUDED.lecturer_id
+                    """, (course_name, course_code, prog, "Main", level, lecturer_id))
+                    
+            conn.commit()
+                    
+        return jsonify({"success": True, "message": "Courses successfully assigned and updated!"}), 201
+
+    except Exception as exc:
+        print("🚨 BULK COURSE ERROR:", exc)
+        return jsonify({"error": "Failed to add courses to database."}), 500
+
+# --- 4. SESSION MANAGEMENT ---
 @app.route('/api/sessions/start', methods=['POST'])
 def start_session():
-    data = request.json
+    data = request.json or {}
     course_id = data.get('course_id')
-    with get_connection() as conn:
-        existing = conn.execute("SELECT id FROM sessions WHERE group_course_id = ? AND status = 'active'", (course_id,)).fetchone()
-        if existing:
-            return jsonify({"status": "success", "message": "Session reactivated"}), 200
-        conn.execute("INSERT INTO sessions (group_course_id, status) VALUES (?, 'active')", (course_id,))
-        conn.commit()
-    return jsonify({"status": "success", "message": "New session started"}), 201
+    if not course_id:
+        return jsonify({"message": "Course ID is required."}), 400
+        
+    try:
+        with get_connection() as conn:
+            existing = conn.execute("SELECT id FROM sessions WHERE group_course_id = %s AND status = 'active'", (course_id,)).fetchone()
+            if existing:
+                return jsonify({"status": "success", "message": "Session reactivated"}), 200
+            conn.execute("INSERT INTO sessions (group_course_id, status) VALUES (%s, 'active')", (course_id,))
+            conn.commit()
+        return jsonify({"status": "success", "message": "New session started"}), 201
+    except Exception as exc:
+        print("Session start error:", exc)
+        return jsonify({"message": "Failed to start session."}), 500
+
 
 @app.route("/api/sessions/close", methods=["POST"])
 def close_session():
     with get_connection() as conn:
-        conn.execute("UPDATE sessions SET status = 'closed', closed_at = datetime('now') WHERE status = 'active'")
+        conn.execute("UPDATE sessions SET status = 'closed', closed_at = NOW() WHERE status = 'active'")
         conn.commit()
     return jsonify({"message": "Session closed"}), 200
+
 
 @app.route("/api/sessions/active", methods=["GET"])
 def get_active_session():
@@ -234,9 +261,79 @@ def get_active_session():
         session = conn.execute("SELECT * FROM sessions WHERE status = 'active' ORDER BY opened_at DESC LIMIT 1").fetchone()
     return jsonify({"session": dict(session) if session else None}), 200
 
-# ==========================================
-# USER AUTHENTICATION ROUTES (Admin & Lecturer)
-# ==========================================
+
+# --- 5. ATTENDANCE LOGS ---
+@app.route("/api/attendance", methods=["GET"])
+def get_attendance_logs():
+    search = request.args.get("search", "").strip()
+    programme = request.args.get("programme", "").strip()
+    level = request.args.get("level", "").strip()
+    group = request.args.get("group", "").strip()
+    
+    try:
+        with get_connection() as conn:
+            query = """
+                SELECT a.id, a.recorded_at, a.verification_mode, 
+                       s.name as student_name, s.index_number,
+                       gc.course_name, gc.group_name, gc.course_code, gc.programme, gc.level
+                FROM attendance a
+                JOIN students s ON a.student_id = s.id
+                JOIN sessions sess ON a.session_id = sess.id
+                JOIN group_courses gc ON sess.group_course_id = gc.id
+                WHERE 1=1
+            """
+            params = []
+            
+            if search:
+                query += " AND (gc.course_code ILIKE %s OR gc.course_name ILIKE %s)"
+                params.extend([f"%{search}%", f"%{search}%"])
+            if programme:
+                query += " AND gc.programme = %s"
+                params.append(programme)
+            if level:
+                query += " AND gc.level = %s"
+                params.append(level)
+            if group and programme == "BSc. Information Technology":
+                query += " AND gc.group_name ILIKE %s"
+                params.append(f"%{group}%")
+                
+            query += " ORDER BY a.recorded_at DESC LIMIT 200"
+            logs = conn.execute(query, params).fetchall()
+            
+        return jsonify([dict(l) for l in logs]), 200
+    except Exception as exc:
+        print("Fetch attendance error:", exc)
+        return jsonify({"error": "Failed to fetch attendance logs."}), 500
+
+
+# --- 6. USERS & AUTHENTICATION ---
+@app.route("/api/users", methods=["GET"])
+def get_all_users():
+    role = request.args.get("role")
+    
+    try:
+        with get_connection() as conn:
+            if role:
+                users = conn.execute("SELECT id, name, email, role, created_at FROM users WHERE role = %s ORDER BY created_at DESC", (role,)).fetchall()
+            else:
+                users = conn.execute("SELECT id, name, email, role, created_at FROM users ORDER BY created_at DESC").fetchall()
+                
+        return jsonify([dict(u) for u in users]), 200
+    except Exception as exc:
+        print("Fetch users error:", exc)
+        return jsonify({"error": "Failed to fetch system users."}), 500
+
+
+@app.route("/api/lecturers", methods=["GET"])
+def get_lecturers():
+    try:
+        with get_connection() as conn:
+            lecturers = conn.execute("SELECT id, name FROM users WHERE role = 'lecturer'").fetchall()
+        return jsonify([dict(l) for l in lecturers]), 200
+    except Exception as exc:
+        print("Error fetching lecturers:", exc)
+        return jsonify({"error": "Failed to fetch lecturers"}), 500
+
 
 @app.route("/api/auth/register", methods=["POST"])
 def register_user():
@@ -244,40 +341,33 @@ def register_user():
     name = (data.get("name") or "").strip()
     email = (data.get("email") or "").strip()
     password = data.get("password") or ""
-    role = data.get("role").strip()
+    role = data.get("role", "").strip()
 
     if not all([name, email, password, role]):
         return jsonify({"error": "All fields are required."}), 400
 
     try:
         with get_connection() as conn:
-            # Check if email already exists
-            existing = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+            existing = conn.execute("SELECT id FROM users WHERE email = %s", (email,)).fetchone()
             if existing:
                 return jsonify({"error": "This email is already registered."}), 409
 
-            # Hash the password securely using werkzeug
             hashed_password = generate_password_hash(password)
 
-            # Insert into the users table we created in Supabase
             conn.execute(
                 """
                 INSERT INTO users (name, email, password_hash, role)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
                 """,
                 (name, email, hashed_password, role)
             )
             conn.commit()
 
-        return jsonify({
-            "success": True,
-            "role": role,
-            "message": "Account created successfully!"
-        }), 201
+        return jsonify({"success": True, "role": role, "message": "Account created successfully!"}), 201
 
     except Exception as exc:
-        print(exc)
-        return jsonify({"error": "Failed to create account. Please try again."}), 500
+        print("Registration Error:", exc)
+        return jsonify({"error": "Failed to create account."}), 500
 
 
 @app.route("/api/auth/login", methods=["POST"])
@@ -291,20 +381,130 @@ def login_user():
 
     try:
         with get_connection() as conn:
-            user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+            user = conn.execute("SELECT * FROM users WHERE email = %s", (email,)).fetchone()
 
-        # Verify user exists and password hash matches using werkzeug
         if user and check_password_hash(user["password_hash"], password):
             return jsonify({
-                "success": True,
-                "role": user["role"],
-                "name": user["name"]
+                "success": True, 
+                "role": user["role"], 
+                "name": user["name"],
+                "email": user["email"] 
             }), 200
         else:
             return jsonify({"error": "Invalid email or password."}), 401
 
     except Exception as exc:
-        print(exc)
-        return jsonify({"error": "Login failed due to a server error."}), 500
+        print("Login Error:", exc)
+        return jsonify({"error": "Login failed."}), 500
+
+
+# --- 7. DASHBOARD METRICS ---
+@app.route("/api/dashboard/stats", methods=["GET"])
+def get_dashboard_stats():
+    try:
+        with get_connection() as conn:
+            student_res = conn.execute("SELECT COUNT(*) as count FROM students").fetchone()
+            course_res = conn.execute("SELECT COUNT(*) as count FROM group_courses").fetchone()
+            attendance_res = conn.execute(
+                "SELECT COUNT(*) as count FROM attendance WHERE DATE(recorded_at) = CURRENT_DATE"
+            ).fetchone()
+            
+            active_session = conn.execute(
+                """
+                SELECT s.id, gc.course_name, gc.course_code, gc.group_name, s.opened_at
+                FROM sessions s 
+                JOIN group_courses gc ON s.group_course_id = gc.id 
+                WHERE s.status = 'active' 
+                ORDER BY s.opened_at DESC LIMIT 1
+                """
+            ).fetchone()
+
+            return jsonify({
+                "students_count": student_res["count"] if student_res else 0,
+                "courses_count": course_res["count"] if course_res else 0,
+                "today_attendance": attendance_res["count"] if attendance_res else 0,
+                "active_session": dict(active_session) if active_session else None
+            }), 200
+    except Exception as exc:
+        print("Dashboard stats error:", exc)
+        return jsonify({"error": "Failed to fetch dashboard metrics."}), 500
+
+
+# --- 8. ADMIN CRUD: STUDENTS ---
+@app.route("/api/students", methods=["GET"])
+def get_all_students():
+    try:
+        with get_connection() as conn:
+            students = conn.execute("SELECT id, name, index_number, programme, level, group_name, admission_year FROM students ORDER BY name ASC").fetchall()
+        return jsonify([dict(s) for s in students]), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+@app.route("/api/students/<int:student_id>", methods=["PUT"])
+def update_student(student_id):
+    data = request.get_json()
+    try:
+        with get_connection() as conn:
+            conn.execute("""
+                UPDATE students 
+                SET name=%s, index_number=%s, programme=%s, level=%s, group_name=%s 
+                WHERE id=%s
+            """, (data.get("name"), data.get("index_number"), data.get("programme"), data.get("level"), data.get("group_name"), student_id))
+            conn.commit()
+        return jsonify({"success": True, "message": "Student updated successfully!"}), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+@app.route("/api/students/<int:student_id>", methods=["DELETE"])
+def delete_student(student_id):
+    try:
+        with get_connection() as conn:
+            conn.execute("DELETE FROM students WHERE id=%s", (student_id,))
+            conn.commit()
+        return jsonify({"success": True, "message": "Student deleted successfully!"}), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+# --- 9. ADMIN CRUD: COURSES ---
+@app.route("/api/courses", methods=["GET"])
+def get_all_courses():
+    try:
+        with get_connection() as conn:
+            courses = conn.execute("""
+                SELECT c.id, c.course_name, c.course_code, c.programme, c.group_name, c.level, u.name as lecturer_name 
+                FROM group_courses c 
+                LEFT JOIN users u ON c.lecturer_id = u.id
+            """).fetchall()
+        return jsonify([dict(c) for c in courses]), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+@app.route("/api/courses/<int:course_id>", methods=["PUT"])
+def update_course(course_id):
+    data = request.get_json()
+    try:
+        with get_connection() as conn:
+            conn.execute("""
+                UPDATE group_courses 
+                SET course_name=%s, course_code=%s, programme=%s, level=%s 
+                WHERE id=%s
+            """, (data.get("course_name"), data.get("course_code"), data.get("programme"), data.get("level"), course_id))
+            conn.commit()
+        return jsonify({"success": True, "message": "Course updated successfully!"}), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+@app.route("/api/courses/<int:course_id>", methods=["DELETE"])
+def delete_course(course_id):
+    try:
+        with get_connection() as conn:
+            conn.execute("DELETE FROM group_courses WHERE id=%s", (course_id,))
+            conn.commit()
+        return jsonify({"success": True, "message": "Course deleted successfully!"}), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
