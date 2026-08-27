@@ -1,8 +1,10 @@
 import os
 import time
 import requests
+import cv2
+from flask import Flask, request, jsonify, Response # <-- Make sure Response is here
+# ... your other imports ...
 from werkzeug.security import generate_password_hash, check_password_hash
-from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 from db import get_connection, init_db
@@ -76,6 +78,78 @@ def register_student():
             return jsonify({"message": "A student with this index number already exists."}), 409
         return jsonify({"message": "Failed to register student."}), 500
     return jsonify({"message": "Student registered successfully.", "student": {"name": name}}), 201
+
+
+# --- PROGRAMME REPS ROUTES ---
+@app.route("/api/course-reps", methods=["GET"])
+def get_programme_reps():
+    try:
+        with get_connection() as conn:
+            # Fetch all students who are flagged as reps
+            query = """
+                SELECT id, name, index_number, programme, level, group_name
+                FROM students
+                WHERE is_course_rep = TRUE
+                ORDER BY programme ASC, level ASC, group_name ASC
+            """
+            reps = conn.execute(query).fetchall()
+            return jsonify([dict(r) for r in reps]), 200
+    except Exception as exc:
+        print("Fetch reps error:", exc)
+        return jsonify({"error": "Failed to fetch programme reps."}), 500
+
+
+@app.route("/api/assign-rep", methods=["POST"])
+def assign_programme_rep():
+    data = request.json
+    index_number = data.get("index_number")
+    programme = data.get("programme")
+    level = data.get("level")
+    group = data.get("group", "")
+    action = data.get("action", "promote")
+
+    if not index_number:
+        return jsonify({"error": "Student Index Number is required."}), 400
+
+    try:
+        with get_connection() as conn:
+            # 1. Verify the student exists
+            student = conn.execute(
+                "SELECT id, name, programme, level, group_name FROM students WHERE index_number = %s", 
+                (index_number,)
+            ).fetchone()
+            
+            if not student:
+                return jsonify({"error": f"No student found with Index Number: {index_number}"}), 404
+
+            # 2. If promoting, verify they actually belong to the selected cohort
+            if action == "promote":
+                if student['programme'] != programme:
+                    return jsonify({"error": f"Student is registered in {student['programme']}, not {programme}."}), 400
+                if str(student['level']) != str(level):
+                    return jsonify({"error": f"Student is in Level {student['level']}, not Level {level}."}), 400
+                if programme == "BSc. Information Technology" and student['group_name'] != group:
+                    return jsonify({"error": f"Student is in Group {student['group_name'] or 'None'}, not Group {group}."}), 400
+
+            # 3. Update their rep status
+            is_rep = True if action == "promote" else False
+            
+            conn.execute(
+                "UPDATE students SET is_course_rep = %s WHERE id = %s", 
+                (is_rep, student['id'])
+            )
+            conn.commit()  # <--- ADD THIS LINE! This permanently saves it to the database
+            
+            if is_rep:
+                msg = f"Successfully promoted {student['name']} to rep for {programme}!"
+            else:
+                msg = f"Revoked rep status for {student['name']}."
+                
+            return jsonify({"message": msg}), 200
+            
+    except Exception as exc:
+        print("Assign rep error:", exc)
+        return jsonify({"error": "An error occurred while updating the student."}), 500
 
 
 # --- 2. LIVE FACE VERIFICATION ENGINE ---
@@ -183,7 +257,6 @@ def recognize_face():
         return jsonify({"status": "error", "message": "Detection failed."}), 500
 
 
-# --- 3. COURSE MANAGEMENT ---
 # --- 3. COURSE MANAGEMENT ---
 @app.route("/api/courses", methods=["POST"])
 def add_course():
@@ -506,5 +579,52 @@ def delete_course(course_id):
         return jsonify({"error": str(exc)}), 500
 
 
+# ==========================================
+# KIOSK LIVE VIDEO STREAMING & FACE DETECTION
+# ==========================================
+
+# Initialize the webcam
+camera = cv2.VideoCapture(0)
+
+# Load OpenCV's built-in face detection classifier (no extra downloads needed!)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+def generate_frames():
+    while True:
+        success, frame = camera.read()
+        if not success:
+            break
+        else:
+            # 1. Flip the frame horizontally for a natural mirror view
+            frame = cv2.flip(frame, 1)
+            
+            # 2. Convert to grayscale for faster face detection processing
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # 3. Detect faces in the frame
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+            
+            # 4. Draw interactive targeting boxes around detected faces
+            for (x, y, w, h) in faces:
+                # Draw main bounding box (Emerald/Green color to match your UI)
+                color = (16, 185, 129) # BGR format for emerald
+                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                
+                # Draw targeting corner accents
+                cv2.putText(frame, "Target Acquired", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            # 5. Compress the processed frame into JPEG format
+            ret, buffer = cv2.imencode('.jpg', frame)
+            frame_bytes = buffer.tobytes()
+            
+            # Yield the frame continuously to the browser stream
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+@app.route('/api/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
+    
