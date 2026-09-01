@@ -9,3 +9,4 @@ opencv-python-headless
 cmake
 face_recognition
 opencv-python-headless==4.9.0.80
+numpy==1.26.4
