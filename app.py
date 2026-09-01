@@ -14,7 +14,7 @@ from db import get_connection, init_db
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:5173", "http://localhost:5174", "http://172.20.10.4:5173", "http://172.20.10.4:5174"])
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Initialize live Supabase database
 init_db()
