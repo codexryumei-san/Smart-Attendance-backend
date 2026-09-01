@@ -5,3 +5,4 @@ python-dotenv
 flask-cors
 requests
 gunicorn
+opencv-python-headless
