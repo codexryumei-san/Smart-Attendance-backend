@@ -2,6 +2,8 @@ import os
 import time
 import requests
 import cv2
+import json
+import numpy as np
 from flask import Flask, request, jsonify, Response # <-- Make sure Response is here
 # ... your other imports ...
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -12,7 +14,7 @@ from db import get_connection, init_db
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:5173", "http://localhost:5174"])
+CORS(app, origins=["http://localhost:5173", "http://localhost:5174", "http://172.20.10.4:5173", "http://172.20.10.4:5174"])
 
 # Initialize live Supabase database
 init_db()
@@ -29,20 +31,30 @@ def health():
     return jsonify({"status": "ok", "message": "Smart Attendance API is running on Supabase & Face++"})
 
 # --- 1. STUDENT REGISTRATION (Dynamic Level Upgrade) ---
+import base64
+import numpy as np
+import cv2
+import json
+import face_recognition
+
+# --- 1. STUDENT REGISTRATION (Dynamic Level Upgrade) ---
 @app.route("/api/register", methods=["POST"])
 def register_student():
     data = request.get_json(silent=True) or {}
 
+    # 1. Grab all fields first
     name = (data.get("name") or "").strip()
     index_number = (data.get("index_number") or "").strip()
     programme = (data.get("programme") or "").strip()
     level = (data.get("level") or "").strip()
+    student_type = data.get('student_type', 'Regular (Morning)')
     admission_year = data.get("admission_year") 
     biometric_consent = bool(data.get("biometric_consent", False))
     image_base64 = data.get("image") or data.get("image_base64") or ""
     group_raw = data.get("group")
     group = str(group_raw).strip() if group_raw else None
 
+    # 2. Validation
     missing = [field for field, value in [("name", name), ("index_number", index_number), ("programme", programme), ("admission_year", admission_year)] if not value]
     if missing:
         return jsonify({"message": f"Missing required fields: {', '.join(missing)}"}), 400
@@ -53,30 +65,58 @@ def register_student():
 
     clean_image = clean_base64(image_base64)
     
+    # 3. Process the image to get the face math
+    try:
+        # Turn the base64 string back into an image that face_recognition can read
+        image_bytes = base64.b64decode(clean_image)
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
+        # ---> ADDED DEBUG LINE HERE <---
+        cv2.imwrite("debug_test_image.jpg", img)
+        
+        rgb_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        encodings = face_recognition.face_encodings(rgb_image)
+        if len(encodings) == 0:
+            return jsonify({"message": "No face detected in the image"}), 400
+        
+        # Grab the first face and convert its math array to a JSON string
+        face_encoding_json = json.dumps(encodings[0].tolist())
+        
+    except Exception as e:
+        print("🚨 IMAGE PROCESSING ERROR:", e)
+        return jsonify({"message": "Invalid image format or processing error."}), 400
+
+    # 4. Save to Database
     try:
         with get_connection() as conn:
+            # STEP A: Save the student details
             cursor = conn.execute(
                 """
-                INSERT INTO students (name, index_number, programme, level, group_name, admission_year, biometric_consent)
-                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
+                INSERT INTO students (name, index_number, programme, level, group_name, admission_year, biometric_consent, student_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
                 """,
-                (name, index_number, programme, level, group, int(admission_year), int(biometric_consent)),
+                (name, index_number, programme, level, group, int(admission_year), int(biometric_consent), student_type),
             )
             student_id = cursor.fetchone()["id"]
             
+            # STEP B: Save the face encoding JSON exactly into your jsonb column
             conn.execute(
                 """
-                INSERT INTO face_encodings (student_id, encoding)
-                VALUES (%s, %s)
+                INSERT INTO face_encodings (student_id, index_number, encoding_data)
+                VALUES (%s, %s, %s)
                 """,
-                (student_id, clean_image.encode('utf-8')),
+                (student_id, index_number, face_encoding_json),
             )
             conn.commit()
+            
     except Exception as exc:
         print("🚨 REGISTRATION ERROR:", exc)
         if "unique constraint" in str(exc).lower():
             return jsonify({"message": "A student with this index number already exists."}), 409
         return jsonify({"message": "Failed to register student."}), 500
+        
     return jsonify({"message": "Student registered successfully.", "student": {"name": name}}), 201
 
 
@@ -260,44 +300,48 @@ def recognize_face():
 # --- 3. COURSE MANAGEMENT ---
 @app.route("/api/courses", methods=["POST"])
 def add_course():
-    data = request.get_json()
-    
+    data = request.json
     course_name = data.get("course_name")
-    course_code = data.get("course_code") 
+    course_code = data.get("course_code")
     level = data.get("level")
+    student_type = data.get("student_type", "Regular (Morning)")
     lecturer_id = data.get("lecturer_id")
     programmes = data.get("programmes", [])
     it_groups = data.get("it_groups", [])
 
-    if not course_name or not programmes or not lecturer_id:
-        return jsonify({"error": "Course details, lecturer, and at least one programme are required."}), 400
+    if not all([course_name, course_code, level, lecturer_id, programmes]):
+        return jsonify({"error": "Missing required fields"}), 400
 
     try:
         with get_connection() as conn:
+            # Loop through the selected programmes from the frontend
             for prog in programmes:
+                # Special handling for IT students with groups
                 if prog == "BSc. Information Technology" and it_groups:
                     for grp in it_groups:
+                        # UPDATED: The conflict rule now checks course_code, programme, AND group_name!
                         conn.execute("""
-                            INSERT INTO group_courses (course_name, course_code, programme, group_name, level, lecturer_id)
-                            VALUES (%s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (group_name, course_code) 
-                            DO UPDATE SET course_name = EXCLUDED.course_name, level = EXCLUDED.level, lecturer_id = EXCLUDED.lecturer_id
-                        """, (course_name, course_code, prog, grp, level, lecturer_id))
+                            INSERT INTO group_courses (course_code, course_name, level, student_type, programme, group_name, lecturer_id)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (course_code, programme, group_name) DO NOTHING
+                        """, (course_code, course_name, level, student_type, prog, grp, lecturer_id))
                 else:
+                    # Standard insertion for all other programmes
+                    # UPDATED: The conflict rule now checks course_code, programme, AND group_name!
                     conn.execute("""
-                        INSERT INTO group_courses (course_name, course_code, programme, group_name, level, lecturer_id)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (group_name, course_code) 
-                        DO UPDATE SET course_name = EXCLUDED.course_name, level = EXCLUDED.level, lecturer_id = EXCLUDED.lecturer_id
-                    """, (course_name, course_code, prog, "Main", level, lecturer_id))
+                        INSERT INTO group_courses (course_code, course_name, level, student_type, programme, group_name, lecturer_id)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (course_code, programme, group_name) DO NOTHING
+                    """, (course_code, course_name, level, student_type, prog, "Main", lecturer_id))
                     
             conn.commit()
-                    
-        return jsonify({"success": True, "message": "Courses successfully assigned and updated!"}), 201
-
+            
+        return jsonify({"message": "Courses generated and assigned successfully!"}), 201
+        
     except Exception as exc:
-        print("🚨 BULK COURSE ERROR:", exc)
-        return jsonify({"error": "Failed to add courses to database."}), 500
+        print(f"Error creating course: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
 
 # --- 4. SESSION MANAGEMENT ---
 @app.route('/api/sessions/start', methods=['POST'])
@@ -347,7 +391,7 @@ def get_attendance_logs():
         with get_connection() as conn:
             query = """
                 SELECT a.id, a.recorded_at, a.verification_mode, 
-                       s.name as student_name, s.index_number,
+                       s.name as student_name, s.index_number, s.student_type, 
                        gc.course_name, gc.group_name, gc.course_code, gc.programme, gc.level
                 FROM attendance a
                 JOIN students s ON a.student_id = s.id
@@ -508,7 +552,8 @@ def get_dashboard_stats():
 def get_all_students():
     try:
         with get_connection() as conn:
-            students = conn.execute("SELECT id, name, index_number, programme, level, group_name, admission_year FROM students ORDER BY name ASC").fetchall()
+            # Added is_course_rep right here!
+            students = conn.execute("SELECT id, name, index_number, programme, level, group_name, admission_year, is_course_rep FROM students ORDER BY name ASC").fetchall()
         return jsonify([dict(s) for s in students]), 200
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -545,7 +590,7 @@ def get_all_courses():
     try:
         with get_connection() as conn:
             courses = conn.execute("""
-                SELECT c.id, c.course_name, c.course_code, c.programme, c.group_name, c.level, u.name as lecturer_name 
+                SELECT c.id, c.course_name, c.course_code, c.programme, c.group_name, c.level, c.student_type, u.name as lecturer_name 
                 FROM group_courses c 
                 LEFT JOIN users u ON c.lecturer_id = u.id
             """).fetchall()
@@ -585,10 +630,8 @@ def delete_course(course_id):
 
 # Initialize the webcam
 camera = cv2.VideoCapture(0)
-
 # Load OpenCV's built-in face detection classifier (no extra downloads needed!)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
 def generate_frames():
     while True:
         success, frame = camera.read()
@@ -626,5 +669,4 @@ def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
     
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
-    
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)

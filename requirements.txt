@@ -5,4 +5,3 @@ python-dotenv
 flask-cors
 requests
 gunicorn
-opencv-python-headless==4.9.0.80
